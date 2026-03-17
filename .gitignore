@@ -1,0 +1,8 @@
+node_modules/
+logs/
+*.log
+*.bak
+.env
+.vscode/
+.idea/
+.claude/

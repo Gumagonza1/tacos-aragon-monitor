@@ -1,0 +1,17 @@
+{
+  "name": "tacos-aragon-monitor",
+  "version": "1.0.0",
+  "description": "Agente de monitoreo de calidad para WhatsApp bot — Tacos Aragón",
+  "main": "agente_monitor.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node agente_monitor.js",
+    "pm2": "pm2 start ecosystem.config.js"
+  },
+  "keywords": ["whatsapp", "monitor", "claude", "anthropic", "bot"],
+  "license": "ISC",
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.78.0",
+    "better-sqlite3": "^12.8.0"
+  }
+}
