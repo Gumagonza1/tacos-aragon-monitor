@@ -35,9 +35,8 @@ const MENU_PATH         = path.join(DATOS, 'menu.csv');
 const NO_DISP_PATH      = path.join(DATOS, 'no_disponible.txt');
 const LOY_CONFIG_PATH   = path.join(DATOS, 'loyverse_config.json');
 const memDb             = require(path.resolve(BASE, 'datos', 'memoria_db'));
+const mensajesDb        = require(path.resolve(BASE, 'datos', 'mensajes_db'));
 const INTERV_PATH       = path.join(DATOS, 'intervenciones_humanas.json');
-const QUEUE_PATH        = path.join(DATOS, 'agente_queue.json');
-const RESPONSES_PATH    = path.join(DATOS, 'agente_responses.json');
 const ESTADO_PATH       = path.join(DATOS, 'agente_estado.json');
 const PENDIENTES_PATH   = path.join(DATOS, 'agente_pendientes.json');
 const LOGS_DIR          = path.join(BASE, 'logs');
@@ -103,22 +102,13 @@ function llamarApi(apiPath) {
     });
 }
 
-// ── COLA / RESPUESTAS ─────────────────────────────────────────────────────────
-function leerQueue()          { try { return JSON.parse(fs.readFileSync(QUEUE_PATH, 'utf8')) || []; } catch(e) { return []; } }
-function escribirQueue(q)     { try { fs.writeFileSync(QUEUE_PATH, JSON.stringify(q, null, 2)); } catch(e) {} }
-function leerResponses()      { try { return JSON.parse(fs.readFileSync(RESPONSES_PATH, 'utf8')) || []; } catch(e) { return []; } }
-function escribirResponses(r) { try { fs.writeFileSync(RESPONSES_PATH, JSON.stringify(r, null, 2)); } catch(e) {} }
-
+// ── COLA / RESPUESTAS (SQLite via mensajes_db) ────────────────────────────────
 function encolarMensaje(id, mensaje) {
-    const q = leerQueue();
-    q.push({ id, mensaje, tipo: 'texto', enviado: false, timestamp: Date.now() });
-    escribirQueue(q);
+    mensajesDb.encolarMensaje(id, mensaje, 'monitor');
 }
 
 function encolarMedia(id, tipo, filePath, caption) {
-    const q = leerQueue();
-    q.push({ id, tipo, filePath, caption: caption || '', enviado: false, timestamp: Date.now() });
-    escribirQueue(q);
+    mensajesDb.encolarMedia(id, tipo, filePath, caption, 'monitor');
 }
 
 // ── GENERACIÓN DE MEDIA (gráficas, audio) ─────────────────────────────────────
@@ -1134,9 +1124,28 @@ async function procesarComandoAdmin(cmd) {
         }
 
         case 'reiniciar': {
+            // Verificar que el orquestador no esté en medio de una recuperación activa
+            const ORCH_DB_PATH = process.env.ORCH_DB_PATH;
+            if (ORCH_DB_PATH) {
+                try {
+                    const Database = require('better-sqlite3');
+                    const orchDb = new Database(ORCH_DB_PATH, { readonly: true });
+                    const falla = orchDb.prepare(
+                        `SELECT en_cooldown FROM fallas WHERE servicio = 'TacosAragon' LIMIT 1`
+                    ).get();
+                    orchDb.close();
+                    if (falla && falla.en_cooldown === 1) {
+                        encolarMensaje('cmd-reiniciar-bloq',
+                            '⚠️ *Monitor:* Reinicio bloqueado — el orquestador ya está ejecutando una recuperación de TacosAragon. Espera a que termine.'
+                        );
+                        break;
+                    }
+                } catch (e) {
+                    console.error('[monitor] No se pudo verificar estado del orquestador:', e.message);
+                }
+            }
             encolarMensaje('cmd-reiniciar', '🔄 *Monitor:* Reiniciando TacosAragon...');
             try {
-                const { execSync } = require('child_process');
                 execSync('pm2 restart TacosAragon', { stdio: 'ignore' });
                 encolarMensaje('cmd-reiniciar-ok', '✅ *Monitor:* `pm2 restart TacosAragon` ejecutado. Verificando conexión en 90s...');
             } catch (e) {
@@ -1162,62 +1171,57 @@ let procesandoRespuestas = false; // Guard anti-reentrancia
 
 async function procesarRespuestas() {
     if (procesandoRespuestas) return; // Evitar solapamiento entre ciclos
-    const responses = leerResponses();
+    const responses = mensajesDb.leerResponsesPendientes();
     if (!responses.length) return;
 
     procesandoRespuestas = true;
-    // Limpiar el archivo INMEDIATAMENTE para que el próximo tick no reprocese los mismos items
-    escribirResponses([]);
 
-    const idsProcessados = [];
     try {
         for (const resp of responses) {
-
-            // Comandos especiales (id empieza con 'cmd-')
-            if (resp.id.startsWith('cmd-')) {
-                await procesarComandoAdmin(resp.texto);
-                idsProcessados.push(resp.id);
-                continue;
-            }
-
-            // Conversación libre (id empieza con 'conv-') — sin alerta pendiente
-            if (resp.id.startsWith('conv-')) {
-                await procesarConversacionLibre(resp.id, resp.texto);
-                idsProcessados.push(resp.id);
-                continue;
-            }
-
-            // Las propuestas se encolan con id 'propuesta-P1' pero el pendiente usa 'P1'
-            const lookupId = resp.id.startsWith('propuesta-') ? resp.id.slice('propuesta-'.length) : resp.id;
-            const pendiente = pendientes.find(p => p.id === lookupId);
-            if (!pendiente) { idsProcessados.push(resp.id); continue; }
-
-            const texto = (resp.texto || '').trim();
-            console.log(`📨 Respuesta admin [${resp.id}]: "${texto.slice(0, 60)}"`);
-
-            if (texto.toLowerCase() === 'si') {
-                if (pendiente.tipo === 'propuesta') {
-                    await aplicarPropuesta(pendiente);
-                } else {
-                    await aplicarSugerenciaAlerta(pendiente);
+            try {
+                // Comandos especiales (id empieza con 'cmd-')
+                if (resp.id.startsWith('cmd-')) {
+                    await procesarComandoAdmin(resp.texto);
+                    mensajesDb.marcarResponseProcesada(resp.rowid);
+                    continue;
                 }
-            } else if (texto.toLowerCase() === 'no') {
-                encolarMensaje(`resp-${resp.id}`, `🤖 Monitor — [${resp.id}] rechazado.`);
-            } else {
-                await procesarInstruccionAdmin(texto, pendiente);
-            }
 
-            pendientes = pendientes.filter(p => p.id !== lookupId);
-            guardarPendientes();
-            idsProcessados.push(resp.id);
+                // Conversación libre (id empieza con 'conv-') — sin alerta pendiente
+                if (resp.id.startsWith('conv-')) {
+                    await procesarConversacionLibre(resp.id, resp.texto);
+                    mensajesDb.marcarResponseProcesada(resp.rowid);
+                    continue;
+                }
+
+                // Las propuestas se encolan con id 'propuesta-P1' pero el pendiente usa 'P1'
+                const lookupId = resp.id.startsWith('propuesta-') ? resp.id.slice('propuesta-'.length) : resp.id;
+                const pendiente = pendientes.find(p => p.id === lookupId);
+                if (!pendiente) { mensajesDb.marcarResponseProcesada(resp.rowid); continue; }
+
+                const texto = (resp.texto || '').trim();
+                console.log(`📨 Respuesta admin [${resp.id}]: "${texto.slice(0, 60)}"`);
+
+                if (texto.toLowerCase() === 'si') {
+                    if (pendiente.tipo === 'propuesta') {
+                        await aplicarPropuesta(pendiente);
+                    } else {
+                        await aplicarSugerenciaAlerta(pendiente);
+                    }
+                } else if (texto.toLowerCase() === 'no') {
+                    encolarMensaje(`resp-${resp.id}`, `🤖 Monitor — [${resp.id}] rechazado.`);
+                } else {
+                    await procesarInstruccionAdmin(texto, pendiente);
+                }
+
+                pendientes = pendientes.filter(p => p.id !== lookupId);
+                guardarPendientes();
+                mensajesDb.marcarResponseProcesada(resp.rowid);
+            } catch (err) {
+                console.error(`[monitor] Error procesando respuesta ${resp.id}:`, err.message);
+                mensajesDb.devolverResponseSinProcesar(resp.rowid);
+            }
         }
     } finally {
-        // Si algún item no pudo procesarse, devolverlo al archivo para el próximo ciclo
-        const noProcessados = responses.filter(r => !idsProcessados.includes(r.id));
-        if (noProcessados.length) {
-            const actuales = leerResponses(); // pueden haber llegado nuevos mientras procesábamos
-            escribirResponses([...noProcessados, ...actuales]);
-        }
         procesandoRespuestas = false;
     }
 }
@@ -1352,8 +1356,6 @@ Respuesta final: resumen ejecutivo breve (máx 300 chars) para el admin.`,
 }
 
 // ── INICIALIZACIÓN ────────────────────────────────────────────────────────────
-if (!fs.existsSync(QUEUE_PATH))     escribirQueue([]);
-if (!fs.existsSync(RESPONSES_PATH)) escribirResponses([]);
 
 // Inicializar tamaño actual de logs (no analizar todo el historial al arrancar)
 try { estadoLogs.errorLogSize  = fs.statSync(ERROR_LOG).size;  } catch(e) {}
@@ -1457,12 +1459,11 @@ setInterval(() => {
 
 // Limpieza de cola cada hora
 setInterval(() => {
-    const q = leerQueue();
-    const hace1h = Date.now() - 3600000;
-    const filtrada = q.filter(i => !i.enviado || i.timestamp > hace1h);
-    if (filtrada.length !== q.length) {
-        escribirQueue(filtrada);
-        console.log(`🧹 Cola limpiada: ${q.length - filtrada.length} items eliminados`);
+    try {
+        mensajesDb.limpiarQueueViejos();
+        console.log('🧹 Cola limpiada (mensajes enviados > 1h eliminados)');
+    } catch (e) {
+        console.error('[monitor] Error en limpieza de cola:', e.message);
     }
 }, 3600000);
 
