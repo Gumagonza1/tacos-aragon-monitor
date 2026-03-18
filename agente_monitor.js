@@ -1,5 +1,24 @@
 'use strict';
 // ─── AGENTE MONITOR DE CALIDAD — Tacos Aragón ────────────────────────────────
+// Este archivo se mantiene por compatibilidad con PM2 (ecosystem.config.js apunta aquí).
+// Toda la lógica vive en index.js y src/.
+require('./index.js');
+
+/* ──────────────────────────────────────────────────────────────────────────────
+   CÓDIGO LEGACY — mantenido como referencia histórica, no se ejecuta.
+   La implementación activa está en:
+     index.js        ← orquestación + intervalos
+     src/config.js   ← rutas, Anthropic client, módulos DB
+     src/estado_db.js← persistencia SQLite (reemplaza JSON files)
+     src/herramientas.js ← TOOLS + executeTool
+     src/agente.js   ← runAgentLoop
+     src/watcher.js  ← monitoreo en tiempo real de conversaciones
+     src/alertas.js  ← alertas + aplicar sugerencias/propuestas
+     src/comandos.js ← comandos del admin + conversación libre
+     src/pm2_watcher.js ← detección reinicios + verificación WhatsApp
+     src/log_watcher.js ← análisis de logs de error
+────────────────────────────────────────────────────────────────────────────── */
+return; // eslint-disable-line no-unreachable
 // Proceso independiente con acceso completo a la API de Anthropic (claude-sonnet-4-6).
 // Capacidades:
 //   • Monitoreo en tiempo real de cada mensaje del bot
