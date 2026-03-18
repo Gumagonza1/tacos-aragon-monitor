@@ -19,13 +19,13 @@ Detects errors such as:
 - Repeated unnecessary questions about info the customer already provided
 - Payment method asked for pickup orders
 
-When a problem is detected, the monitor sends a WhatsApp alert to the admin with:
+When a problem is detected, the monitor sends a Telegram alert to the admin with:
 - Severity level (High / Medium / Low)
 - Affected customer's phone number
 - Problem description
 - Literal conversation excerpt
 - Correction suggestion
-- Commands to approve or reject (`!m si` / `!m no`)
+- Inline buttons ✅ Apply / ❌ Skip (or text commands `!m si` / `!m no`)
 
 ### Code proposals
 When the same error repeats structurally, the monitor can propose direct changes to:
@@ -88,12 +88,12 @@ index.js                             index.js → src/
 | `ejecutar_shell` | Runs read-only commands (tail, cat, grep, pm2 status/logs) |
 | `consultar_api` | Calls the central bot API for sales/order data |
 | `proponer_cambio` | Proposes a code change for admin approval |
-| `enviar_media` | Sends an image, audio, or file to the admin via WhatsApp |
+| `enviar_media` | Sends an image, audio, or file to the admin via Telegram |
 | `cargar_skill` | Loads specialized instructions (alerts, proposals, logs, etc.) |
 
 ---
 
-## Admin commands (via WhatsApp)
+## Admin commands (via Telegram)
 
 | Command | Action |
 |---------|--------|
@@ -231,13 +231,13 @@ Detecta errores como:
 - Preguntas repetidas innecesarias sobre info ya proporcionada por el cliente
 - Método de pago preguntado en órdenes de recoger
 
-Cuando detecta un problema, el monitor envía una alerta por WhatsApp al administrador con:
+Cuando detecta un problema, el monitor envía una alerta por Telegram al administrador con:
 - Nivel de severidad (Alta / Media / Baja)
 - Teléfono del cliente afectado
 - Descripción del problema
 - Fragmento literal de la conversación
 - Sugerencia de corrección
-- Comandos para aprobar o rechazar (`!m si` / `!m no`)
+- Botones inline ✅ Aplicar / ❌ Omitir (o comandos `!m si` / `!m no`)
 
 ### Propuestas de código
 Cuando el mismo error se repite de forma estructural, el monitor puede proponer cambios directos a:
@@ -300,12 +300,12 @@ index.js                             index.js → src/
 | `ejecutar_shell` | Ejecuta comandos de lectura (tail, cat, grep, pm2 status/logs) |
 | `consultar_api` | Llama a la API central del bot para datos de ventas/órdenes |
 | `proponer_cambio` | Propone un cambio de código para aprobación del admin |
-| `enviar_media` | Envía imagen, audio o archivo al admin por WhatsApp |
+| `enviar_media` | Envía imagen, audio o archivo al admin por Telegram |
 | `cargar_skill` | Carga instrucciones especializadas (alertas, propuestas, logs, etc.) |
 
 ---
 
-## Comandos del admin (vía WhatsApp)
+## Comandos del admin (vía Telegram)
 
 | Comando | Acción |
 |---------|--------|
