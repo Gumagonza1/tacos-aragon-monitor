@@ -25,8 +25,8 @@ No proponer por errores de una sola ocurrencia que pueden ser casuales.
 
 ## Flujo de aprobación
 1. Monitor crea propuesta → se envía al admin por WhatsApp
-2. Admin responde `!m si` → se aplica el cambio
-3. Admin responde `!m no` → se descarta
+2. Admin responde `!m ✅` → se aplica el cambio
+3. Admin responde `!m ❌` → se descarta
 
 ## No proponer si
 - No has leído el archivo actual primero (puede haber duplicado ya)

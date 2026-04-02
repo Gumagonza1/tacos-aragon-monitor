@@ -1,6 +1,6 @@
 # Tacos Aragón — Quality Monitor Agent
 
-Independent process that watches the Tacos Aragón WhatsApp bot conversations in real time. Uses an intelligent agent via NLP processing to analyze exchanges, detect quality errors, and propose automatic corrections to the admin.
+Independent process that watches the Tacos Aragón WhatsApp bot conversations in real time. Uses Claude Sonnet 4.6 (Anthropic) with tool use to analyze exchanges, detect quality errors, and propose automatic corrections to the admin.
 
 ---
 
@@ -9,7 +9,7 @@ Independent process that watches the Tacos Aragón WhatsApp bot conversations in
 ### Real-time monitoring
 - Reads the main bot's SQLite database (`conversaciones.db`) every time a change is detected.
 - For each new or updated conversation, extracts the lines it hasn't analyzed yet.
-- Sends that fragment to the intelligent agent to detect whether a service error occurred.
+- Sends that fragment to Claude Sonnet to detect whether a service error occurred.
 
 ### Problem detection
 Detects errors such as:
@@ -25,7 +25,7 @@ When a problem is detected, the monitor sends a Telegram alert to the admin with
 - Problem description
 - Literal conversation excerpt
 - Correction suggestion
-- Inline buttons ✅ Apply / ❌ Skip (or text commands `!m si` / `!m no`)
+- Inline buttons ✅ Apply / ❌ Skip (or text commands `!m ✅` / `!m ❌`)
 
 ### Code proposals
 When the same error repeats structurally, the monitor can propose direct changes to:
@@ -97,8 +97,8 @@ index.js                             index.js → src/
 
 | Command | Action |
 |---------|--------|
-| `!m si` | Apply last pending alert/proposal |
-| `!m no` | Reject last pending alert/proposal |
+| `!m ✅` | Apply last pending alert/proposal |
+| `!m ❌` | Reject last pending alert/proposal |
 | `!m reporte` | Deep analysis with tool use |
 | `!m estado` | Monitor status (no API call) |
 | `!m propuestas` | List pending code proposals |
@@ -113,7 +113,7 @@ index.js                             index.js → src/
 - Node.js 18+
 - PM2 (`npm install -g pm2`)
 - The main Tacos Aragón bot running (they share the SQLite database)
-- NLP API Key (configured in `ecosystem.config.js`)
+- Anthropic API key (configured in `ecosystem.config.js`)
 
 ### Steps
 
@@ -159,7 +159,7 @@ If `BOT_BASE` is not set, the monitor assumes the bot is at `../bot-tacos` relat
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `ANTHROPIC_KEY` | Yes | NLP API Key. Alternative: `datos/anthropic_key.txt` file in the main bot |
+| `ANTHROPIC_KEY` | Yes | Anthropic API key (Claude Sonnet). Alternative: `datos/anthropic_key.txt` file in the main bot |
 | `BOT_BASE` | No | Path to the main bot's root directory. Default: `../bot-tacos` |
 | `TACOS_API_URL` | No | Central bot API URL. Default: `http://localhost:3001` |
 | `TACOS_API_TOKEN` | No | Central API auth token |
@@ -196,6 +196,34 @@ tacos-aragon-monitor/
 
 ---
 
+## Docker deployment
+
+The monitor runs as a separate service in the same `docker-compose.yml` as the main bot:
+
+```yaml
+monitor:
+  build: .
+  container_name: bot-tacos-monitor
+  command: ["node", "monitor/agente_monitor.js"]
+  volumes:
+    - session-data:/data/session
+    - ./datos:/app/datos
+    - ./logs:/app/logs
+  environment:
+    - NODE_ENV=production
+    - TZ=America/Hermosillo
+    - NUMEROS_ADMIN=${NUMEROS_ADMIN}
+    - SESSION_DIR=/data/session
+  restart: unless-stopped
+  depends_on:
+    bot:
+      condition: service_healthy
+```
+
+The monitor shares volumes with the bot (`datos/`, `logs/`, `session-data`) and waits for the bot to be healthy before starting.
+
+---
+
 ## Integration with the main bot
 
 This monitor is part of the **Tacos Aragón** ecosystem:
@@ -212,7 +240,7 @@ All three processes run independently on the same machine and communicate throug
 
 # Tacos Aragón — Agente Monitor de Calidad
 
-Proceso independiente que vigila en tiempo real las conversaciones del bot de WhatsApp de Tacos Aragón. Usa un agente inteligente con procesamiento de lenguaje natural para analizar intercambios, detectar errores de calidad y proponer correcciones automáticas al admin.
+Proceso independiente que vigila en tiempo real las conversaciones del bot de WhatsApp de Tacos Aragón. Usa Claude Sonnet 4.6 (Anthropic) con tool use para analizar intercambios, detectar errores de calidad y proponer correcciones automáticas al admin.
 
 ---
 
@@ -221,7 +249,7 @@ Proceso independiente que vigila en tiempo real las conversaciones del bot de Wh
 ### Vigilancia en tiempo real
 - Lee la base de datos SQLite del bot principal (`conversaciones.db`) cada vez que hay un cambio.
 - Para cada conversación nueva o actualizada, extrae las últimas líneas que no ha analizado todavía.
-- Envía ese fragmento al agente inteligente para que detecte si hubo algún error de atención.
+- Envía ese fragmento a Claude Sonnet para que detecte si hubo algún error de atención.
 
 ### Detección de problemas
 Detecta errores como:
@@ -237,7 +265,7 @@ Cuando detecta un problema, el monitor envía una alerta por Telegram al adminis
 - Descripción del problema
 - Fragmento literal de la conversación
 - Sugerencia de corrección
-- Botones inline ✅ Aplicar / ❌ Omitir (o comandos `!m si` / `!m no`)
+- Botones inline ✅ Aplicar / ❌ Omitir (o comandos `!m ✅` / `!m ❌`)
 
 ### Propuestas de código
 Cuando el mismo error se repite de forma estructural, el monitor puede proponer cambios directos a:
@@ -309,8 +337,8 @@ index.js                             index.js → src/
 
 | Comando | Acción |
 |---------|--------|
-| `!m si` | Aplicar última alerta/propuesta pendiente |
-| `!m no` | Rechazar última alerta/propuesta pendiente |
+| `!m ✅` | Aplicar última alerta/propuesta pendiente |
+| `!m ❌` | Rechazar última alerta/propuesta pendiente |
 | `!m reporte` | Análisis profundo con tool use |
 | `!m estado` | Estado del monitor (sin consumir API) |
 | `!m propuestas` | Listar propuestas de código pendientes |
@@ -325,7 +353,7 @@ index.js                             index.js → src/
 - Node.js 18+
 - PM2 (`npm install -g pm2`)
 - El bot principal de Tacos Aragón corriendo (comparten la base de datos SQLite)
-- API Key del agente inteligente (configurada en `ecosystem.config.js`)
+- API key de Anthropic (configurada en `ecosystem.config.js`)
 
 ### Pasos
 
@@ -371,7 +399,7 @@ Si no configuras `BOT_BASE`, el monitor asume que el bot está en `../bot-tacos`
 
 | Variable | Requerida | Descripción |
 |----------|-----------|-------------|
-| `ANTHROPIC_KEY` | Sí | API Key del agente inteligente. Alternativa: archivo `datos/anthropic_key.txt` en el bot principal |
+| `ANTHROPIC_KEY` | Sí | API key de Anthropic (Claude Sonnet). Alternativa: archivo `datos/anthropic_key.txt` en el bot principal |
 | `BOT_BASE` | No | Ruta al directorio raíz del bot principal. Default: `../bot-tacos` |
 | `TACOS_API_URL` | No | URL de la API central del bot. Default: `http://localhost:3001` |
 | `TACOS_API_TOKEN` | No | Token de autenticación de la API central |
@@ -405,6 +433,34 @@ tacos-aragon-monitor/
 ├── package.json
 └── .gitignore
 ```
+
+---
+
+## Despliegue con Docker
+
+El monitor corre como servicio separado en el mismo `docker-compose.yml` del bot principal:
+
+```yaml
+monitor:
+  build: .
+  container_name: bot-tacos-monitor
+  command: ["node", "monitor/agente_monitor.js"]
+  volumes:
+    - session-data:/data/session
+    - ./datos:/app/datos
+    - ./logs:/app/logs
+  environment:
+    - NODE_ENV=production
+    - TZ=America/Hermosillo
+    - NUMEROS_ADMIN=${NUMEROS_ADMIN}
+    - SESSION_DIR=/data/session
+  restart: unless-stopped
+  depends_on:
+    bot:
+      condition: service_healthy
+```
+
+El monitor comparte volúmenes con el bot (`datos/`, `logs/`, `session-data`) y espera a que el bot esté healthy antes de iniciar.
 
 ---
 

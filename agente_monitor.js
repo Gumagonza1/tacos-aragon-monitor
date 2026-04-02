@@ -1,24 +1,5 @@
 'use strict';
 // ─── AGENTE MONITOR DE CALIDAD — Tacos Aragón ────────────────────────────────
-// Este archivo se mantiene por compatibilidad con PM2 (ecosystem.config.js apunta aquí).
-// Toda la lógica vive en index.js y src/.
-require('./index.js');
-
-/* ──────────────────────────────────────────────────────────────────────────────
-   CÓDIGO LEGACY — mantenido como referencia histórica, no se ejecuta.
-   La implementación activa está en:
-     index.js        ← orquestación + intervalos
-     src/config.js   ← rutas, Anthropic client, módulos DB
-     src/estado_db.js← persistencia SQLite (reemplaza JSON files)
-     src/herramientas.js ← TOOLS + executeTool
-     src/agente.js   ← runAgentLoop
-     src/watcher.js  ← monitoreo en tiempo real de conversaciones
-     src/alertas.js  ← alertas + aplicar sugerencias/propuestas
-     src/comandos.js ← comandos del admin + conversación libre
-     src/pm2_watcher.js ← detección reinicios + verificación WhatsApp
-     src/log_watcher.js ← análisis de logs de error
-────────────────────────────────────────────────────────────────────────────── */
-return; // eslint-disable-line no-unreachable
 // Proceso independiente con acceso completo a la API de Anthropic (claude-sonnet-4-6).
 // Capacidades:
 //   • Monitoreo en tiempo real de cada mensaje del bot
@@ -42,36 +23,27 @@ const path          = require('path');
 const http          = require('http');
 const https         = require('https');
 const { execSync }  = require('child_process');
-const Anthropic     = require('@anthropic-ai/sdk');
+const { ejecutarRapido, ejecutarProfundo } = require('./claude-runner');
 
 // ── RUTAS ─────────────────────────────────────────────────────────────────────
-// BOT_BASE apunta al directorio raíz del bot principal (donde están datos/ y logs/).
-// Por defecto asume que el bot está en ../bot-tacos respecto a este repo.
-const BASE              = process.env.BOT_BASE || path.join(__dirname, '..', 'bot-tacos');
+const BASE              = path.join(__dirname, '..');
 const DATOS             = path.join(BASE, 'datos');
 const INSTRUCCIONES_PATH= path.join(DATOS, 'instrucciones.txt');
+const REGLAS_MON_PATH   = path.join(DATOS, 'reglas_monitor.txt');
 const MENU_PATH         = path.join(DATOS, 'menu.csv');
 const NO_DISP_PATH      = path.join(DATOS, 'no_disponible.txt');
 const LOY_CONFIG_PATH   = path.join(DATOS, 'loyverse_config.json');
-const memDb             = require(path.resolve(BASE, 'datos', 'memoria_db'));
-const mensajesDb        = require(path.resolve(BASE, 'datos', 'mensajes_db'));
+const memDb             = require('../datos/memoria_db');
+const mensajesDb        = require('../datos/mensajes_db');
 const INTERV_PATH       = path.join(DATOS, 'intervenciones_humanas.json');
 const ESTADO_PATH       = path.join(DATOS, 'agente_estado.json');
 const PENDIENTES_PATH   = path.join(DATOS, 'agente_pendientes.json');
 const LOGS_DIR          = path.join(BASE, 'logs');
 const ERROR_LOG         = path.join(LOGS_DIR, 'error.log');
 const OUTPUT_LOG        = path.join(LOGS_DIR, 'output.log');
+const CHANGELOG_FILE    = path.join(process.env.SESSION_DIR || '/data/session', 'changelogs', 'MonitorBot.jsonl');
 
-// ── API KEY ───────────────────────────────────────────────────────────────────
-let ANTHROPIC_KEY = '';
-try {
-    ANTHROPIC_KEY = process.env.ANTHROPIC_KEY ||
-        fs.readFileSync(path.join(DATOS, 'anthropic_key.txt'), 'utf8').trim();
-} catch (e) {
-    console.error('❌ Falta ANTHROPIC_KEY. Ponlo en env o en datos/anthropic_key.txt');
-    process.exit(1);
-}
-const anthropic = new Anthropic({ apiKey: ANTHROPIC_KEY });
+// ── API KEY — eliminado: usa claude -p (plan Max, sin API key) ───────────────
 
 // ── ESTADO ────────────────────────────────────────────────────────────────────
 let estadoConv       = {};  // { phone: lastAnalyzedLength }
@@ -92,6 +64,23 @@ try {
         estadoConv = JSON.parse(fs.readFileSync(ESTADO_PATH, 'utf8'));
 } catch (e) { estadoConv = {}; }
 
+// Restaurar pendientes del disco para que los botones de Telegram funcionen tras reinicios
+try {
+    if (fs.existsSync(PENDIENTES_PATH)) {
+        pendientes = JSON.parse(fs.readFileSync(PENDIENTES_PATH, 'utf8'));
+        for (const p of pendientes) {
+            const id = p.datos?.id || p.id || '';
+            if (id.startsWith('P')) {
+                const n = parseInt(id.slice(1), 10);
+                if (!isNaN(n) && n > propuestaCounter) propuestaCounter = n;
+            } else if (id.startsWith('M')) {
+                const n = parseInt(id.slice(1), 10);
+                if (!isNaN(n) && n > alertaCounter) alertaCounter = n;
+            }
+        }
+    }
+} catch (e) { pendientes = []; }
+
 function guardarEstado() {
     try { fs.writeFileSync(ESTADO_PATH, JSON.stringify(estadoConv, null, 2)); } catch (e) {}
 }
@@ -100,9 +89,19 @@ function guardarPendientes() {
     try { fs.writeFileSync(PENDIENTES_PATH, JSON.stringify(pendientes, null, 2)); } catch (e) {}
 }
 
+function logCambio({ titulo, desc = '', archivos = [], tags = [], origen = 'user' }) {
+    try {
+        const entry = { ts: new Date().toISOString(), agente: 'MonitorBot', origen, titulo, desc, archivos, tags };
+        fs.mkdirSync(path.dirname(CHANGELOG_FILE), { recursive: true });
+        fs.appendFileSync(CHANGELOG_FILE, JSON.stringify(entry) + '\n', 'utf8');
+    } catch (e) {
+        console.warn('⚠️ logCambio error:', e.message);
+    }
+}
+
 // ── LLAMADA HTTP A LA API CENTRAL ─────────────────────────────────────────────
 function llamarApi(apiPath) {
-    const API_URL   = process.env.TACOS_API_URL   || 'http://localhost:3001';
+    const API_URL   = process.env.TACOS_API_URL   || 'http://tacos-api:3001';
     const API_TOKEN = process.env.TACOS_API_TOKEN || '';
     const parsed    = new URL(apiPath, API_URL);
     return new Promise((resolve, reject) => {
@@ -121,7 +120,7 @@ function llamarApi(apiPath) {
     });
 }
 
-// ── COLA / RESPUESTAS (SQLite via mensajes_db) ────────────────────────────────
+// ── COLA / RESPUESTAS (SQLite compartida — sin race conditions) ───────────────
 function encolarMensaje(id, mensaje) {
     mensajesDb.encolarMensaje(id, mensaje, 'monitor');
 }
@@ -565,7 +564,7 @@ async function executeTool(name, input) {
 
                 encolarMensaje(
                     `propuesta-${id}`,
-                    `🔧 *PROPUESTA DE CÓDIGO* [${id}]\n` +
+                    `🔧 *PROPUESTA DE CÓDIGO* (${id})\n` +
                     `📄 Archivo: \`${input.archivo}\`\n\n` +
                     `💡 ${input.descripcion}\n\n` +
                     `${preview}\n\n` +
@@ -638,39 +637,86 @@ async function executeTool(name, input) {
     }
 }
 
-// ── BUCLE AGÉNTICO (tool use) ─────────────────────────────────────────────────
-async function runAgentLoop(systemPrompt, userMessage, maxIter = 12) {
-    const messages = [{ role: 'user', content: userMessage }];
-    let iter = 0;
+// ── BUCLE AGÉNTICO → claude -p con MCP project-tacos-bot ─────────────────────
+//
+// Reemplaza la integración directa con Anthropic SDK.
+// Claude usa las herramientas MCP del servidor para leer archivos, ejecutar
+// comandos, ver logs y git. Las propuestas de código se devuelven como bloques
+// PROPUESTA_CAMBIO...FIN_PROPUESTA en el texto de salida.
 
-    while (iter++ < maxIter) {
-        const response = await anthropic.messages.create({
-            model:      'claude-sonnet-4-6',
-            max_tokens: 4096,
-            system:     systemPrompt,
-            tools:      TOOLS,
-            messages
-        });
+async function runAgentLoop(systemPrompt, userMessage) {
+    const resultado = await ejecutarProfundo(systemPrompt, userMessage, 300_000);
+    return resultado.output || 'Análisis completado.';
+}
 
-        if (response.stop_reason === 'end_turn') {
-            return response.content.find(c => c.type === 'text')?.text || '';
-        }
+// ── Parser de propuestas de código en el output de Claude ─────────────────────
+//
+// Claude incluye bloques estructurados en su respuesta cuando quiere proponer
+// cambios. Este parser los extrae y crea entradas en `pendientes`.
+//
+// Formato esperado en el output:
+//   PROPUESTA_CAMBIO
+//   archivo: instrucciones.txt
+//   descripcion: Añadir regla sobre X
+//   buscar: (texto exacto a reemplazar, vacío si añadir al final)
+//   reemplazar: (nuevo texto)
+//   FIN_PROPUESTA
 
-        if (response.stop_reason === 'tool_use') {
-            messages.push({ role: 'assistant', content: response.content });
-            const toolResults = [];
-            for (const block of response.content) {
-                if (block.type !== 'tool_use') continue;
-                console.log(`  🔧 Tool: ${block.name}(${JSON.stringify(block.input).slice(0, 100)})`);
-                const result = await executeTool(block.name, block.input);
-                toolResults.push({ type: 'tool_result', tool_use_id: block.id, content: String(result) });
-            }
-            messages.push({ role: 'user', content: toolResults });
-        } else {
-            break;
+function parsearYEncolarPropuestas(outputText) {
+    const regex = /PROPUESTA_CAMBIO\n([\s\S]*?)FIN_PROPUESTA/g;
+    let match;
+    while ((match = regex.exec(outputText)) !== null) {
+        try {
+            const bloque = match[1];
+            const get = (campo) => {
+                const m = bloque.match(new RegExp(`^${campo}:\\s*(.*)`, 'm'));
+                return m ? m[1].trim() : '';
+            };
+            // Para campos multilínea (buscar / reemplazar), tomar desde la etiqueta hasta la siguiente
+            const getMultilinea = (campo, siguiente) => {
+                const pattern = new RegExp(`^${campo}:\\s*([\\s\\S]*?)(?=^${siguiente}:|$)`, 'm');
+                const m = bloque.match(pattern);
+                return m ? m[1].trim() : '';
+            };
+
+            const archivo     = get('archivo');
+            const descripcion = get('descripcion');
+            const buscar      = getMultilinea('buscar', 'reemplazar');
+            const reemplazar  = getMultilinea('reemplazar', 'FIN_PROPUESTA');
+
+            if (!archivo || !descripcion || !reemplazar) continue;
+
+            propuestaCounter++;
+            const id = `P${propuestaCounter}`;
+            const esJs = archivo.endsWith('.js');
+            const propuesta = {
+                id, archivo, descripcion,
+                buscar: buscar || '',
+                reemplazar,
+                timestamp: Date.now(), aplicada: false
+            };
+
+            pendientes.push({ id, tipo: 'propuesta', datos: propuesta, timestamp: Date.now() });
+            guardarPendientes();
+
+            const preview = buscar
+                ? `🔴 _Reemplazar:_\n\`${buscar.slice(0, 180)}\`\n\n🟢 _Con:_\n\`${reemplazar.slice(0, 180)}\``
+                : `🟢 _Añadir al final:_\n\`${reemplazar.slice(0, 300)}\``;
+
+            encolarMensaje(
+                `propuesta-${id}`,
+                `🔧 *PROPUESTA DE CÓDIGO* (${id})\n` +
+                `📄 Archivo: \`${archivo}\`\n\n` +
+                `💡 ${descripcion}\n\n` +
+                `${preview}\n\n` +
+                (esJs ? `⚠️ _Se hará backup automático antes de aplicar_\n\n` : '') +
+                `!m si  →  aplicar\n!m no  →  rechazar`
+            );
+            console.log(`  📤 Propuesta [${id}] encolada desde output de Claude`);
+        } catch (e) {
+            console.warn(`  ⚠️ Error parseando bloque PROPUESTA_CAMBIO:`, e.message);
         }
     }
-    return 'Análisis completado.';
 }
 
 // ── MONITOREO EN TIEMPO REAL (llamada rápida, sin tools) ─────────────────────
@@ -697,23 +743,23 @@ function buildQuickSystem() {
     // Extraer sólo los nombres de productos del CSV para no inflar el prompt
     const menuLineas = menu.split('\n').slice(0, 120).join('\n'); // primeras ~120 líneas
 
-    return `Eres el agente de control de calidad del bot de WhatsApp de Tacos Aragón.
+    return `<sistema>
+<identidad>Eres el agente de control de calidad del bot de WhatsApp de Tacos Aragón.</identidad>
+
+<tarea>
 Recibirás el historial reciente de una conversación y los mensajes nuevos a evaluar.
 Tu trabajo: detectar errores REALES y CONCRETOS del bot. Sé preciso, no reportes falsos positivos.
+</tarea>
 
-════════════════════════════════════════════
-INSTRUCCIONES COMPLETAS DEL BOT (conócelas a fondo):
-════════════════════════════════════════════
+<instrucciones_bot>
 ${instrucciones}
+</instrucciones_bot>
 
-════════════════════════════════════════════
-MENÚ VIGENTE (CSV):
-════════════════════════════════════════════
+<menu_vigente formato="CSV">
 ${menuLineas}
-${noDisp ? `\n⛔ NO DISPONIBLES HOY (no sugerir ni confirmar nunca):\n${noDisp}\n` : ''}
-════════════════════════════════════════════
-QUÉ DEBES DETECTAR:
-════════════════════════════════════════════
+</menu_vigente>
+${noDisp ? `\n<no_disponibles>⛔ No sugerir ni confirmar nunca:\n${noDisp}\n</no_disponibles>\n` : ''}
+<detectar>
 1. Precio incorrecto (distinto al menú vigente)
 2. Ítem NO DISPONIBLE sugerido, ofrecido o incluido en orden
 3. Orden confirmada con ítems que el cliente NO pidió, o faltantes respecto a lo que pidió
@@ -724,29 +770,30 @@ QUÉ DEBES DETECTAR:
 8. El bot ignoró o contradijo cualquier otra regla explícita de las instrucciones
 9. Errores de tono: el bot fue grosero, condescendiente o inapropiado
 10. El bot dio información falsa sobre horarios, métodos de pago o políticas del negocio
+</detectar>
 
-CRITERIO: Usa el historial reciente como contexto para entender la conversación completa.
+<criterio>
+Usa el historial reciente como contexto para entender la conversación completa.
 Evalúa los mensajes nuevos a la luz del historial — no los juzgues fuera de contexto.
+</criterio>
 
+<formato_respuesta>
 Si todo está bien → responde SOLO la palabra: OK
 Si hay problema → responde SOLO JSON (sin markdown, sin bloques de código, JSON puro):
-{"problema":"qué hizo mal el bot (específico)","severidad":"alta|media|baja","fragmento":"cita literal del texto erróneo (máx 250 chars)","sugerencia":"corrección concreta y accionable","regla_violada":"qué regla de las instrucciones se incumplió"}`;
+{"problema":"qué hizo mal el bot (específico)","severidad":"alta|media|baja","fragmento":"cita literal del texto erróneo (máx 250 chars)","sugerencia":"corrección concreta y accionable","regla_violada":"qué regla de las instrucciones se incumplió"}
+</formato_respuesta>
+</sistema>`;
 }
 
 async function analizarIntercambioRapido(telefono, contextoCompleto, nuevasLineas) {
     try {
-        const userContent =
-            `CLIENTE: ${telefono}\n\n` +
-            `══ HISTORIAL RECIENTE (contexto) ══\n${contextoCompleto}\n\n` +
-            `══ MENSAJES NUEVOS A EVALUAR ══\n${nuevasLineas}`;
-
-        const resp = await anthropic.messages.create({
-            model:      'claude-sonnet-4-6',
-            max_tokens: 2048,
-            system:     buildQuickSystem(),
-            messages:   [{ role: 'user', content: userContent }]
-        });
-        return resp.content[0].text.trim();
+        const system = buildQuickSystem();
+        const user   =
+            `<evaluacion cliente="${telefono}">\n` +
+            `<historial_reciente>\n${contextoCompleto}\n</historial_reciente>\n\n` +
+            `<mensajes_nuevos>\n${nuevasLineas}\n</mensajes_nuevos>\n</evaluacion>`;
+        const fullPrompt = `${system}\n\n${user}`;
+        return (await ejecutarRapido(fullPrompt, 60_000)).trim() || 'OK';
     } catch (e) {
         console.error(`❌ Error Claude [${telefono}]:`, e.message);
         return 'OK';
@@ -828,29 +875,60 @@ function encolarAlerta(telefono, problema, intercambio) {
     console.log(`  📤 Alerta encolada: ${id}`);
 }
 
-// ── ANÁLISIS PROFUNDO (bucle agéntico con tools) ───────────────────────────────
-const SYSTEM_PROFUNDO = `Eres el agente de control de calidad y mejora continua del bot de WhatsApp de Tacos Aragón.
-Tienes acceso completo a todas las herramientas del sistema, incluyendo ejecución de shell.
+// ── ANÁLISIS PROFUNDO (claude -p + MCP project-tacos-bot) ────────────────────
+const SYSTEM_PROFUNDO = `<sistema>
+<identidad>
+Eres el agente de control de calidad y mejora continua del bot de WhatsApp de Tacos Aragón.
+Tienes acceso completo al proyecto bot-tacos via herramientas MCP: read_file, edit_file, write_file,
+search_code, list_files, run_command, view_logs, git_status, git_diff, restart_process, run_tests.
+</identidad>
 
-TU PROCESO COMPLETO:
-1. Revisa los logs de error recientes: ejecutar_shell("tail -200 logs/error.log")
-2. Revisa actividad reciente del bot: ejecutar_shell("tail -150 logs/output.log")
-3. Lee las intervenciones humanas recientes (leer_intervenciones) — ¿qué causó que el admin tomara control?
-4. Lista las conversaciones activas (listar_conversaciones) e identifica las más largas o problemáticas
-5. Para conversaciones sospechosas, léelas (leer_conversacion) y analiza qué falló
-6. Si detectas un patrón recurrente, búscalo en todas las conversaciones (buscar_en_conversaciones)
-7. Para errores de código, busca en logs: ejecutar_shell("grep -n 'Error\\|❌' logs/error.log | tail -30")
-8. Lee el código relevante (leer_archivo) para entender la causa raíz
-9. Propón cambios concretos usando proponer_cambio (instrucciones.txt para reglas, index.js para lógica)
+<proceso>
+1. Revisa logs recientes del bot: view_logs(lines=200)
+2. Revisa logs de error: run_command("tail -200 logs/error.log")
+3. Lee intervenciones humanas recientes: read_file(path="datos/intervenciones_humanas.json")
+4. Lista conversaciones activas: list_files(path="datos/") — identifica archivos grandes
+5. Para conversaciones sospechosas: read_file(path="datos/conversaciones/TELEFONO.txt") o search_code
+6. Si detectas patrón recurrente: search_code(pattern="texto_buscado", glob="datos/**")
+7. Para errores de código: search_code(pattern="Error|❌", glob="logs/error.log")
+8. Lee el código relevante: read_file(path="index.js") o read_file(path="datos/instrucciones.txt")
+9. Para datos de ventas: run_command con curl a la API local:
+   run_command("curl -s -H \\"x-api-token: SCRUBBED_TACOS_API_TOKEN\\" http://tacos-api:3001/api/ventas/resumen?periodo=hoy")
+</proceso>
 
-REGLAS:
-- Siempre empieza por los logs — ahí están los errores reales del sistema
-- Solo propón cambios que tengas suficiente evidencia para justificar
-- Para instrucciones.txt: agrega reglas claras y específicas
-- Para index.js: propón cambios puntuales con buscar/reemplazar exacto
+<proponer_cambios>
+Si identificas un cambio necesario en instrucciones.txt o index.js, inclúyelo en tu respuesta
+con este formato EXACTO (el sistema lo parsea automáticamente):
+
+PROPUESTA_CAMBIO
+archivo: instrucciones.txt
+descripcion: Añadir regla sobre X porque Y
+buscar: (texto exacto a reemplazar — dejar vacío si añadir al final)
+reemplazar: (nuevo texto o regla nueva)
+FIN_PROPUESTA
+</proponer_cambios>
+
+<reglas>
+- Siempre empieza por view_logs — ahí están los errores reales del sistema
+- Solo propón cambios con evidencia suficiente en los logs/conversaciones
+- Para instrucciones.txt: reglas claras y específicas
+- Para index.js: cambios puntuales con buscar/reemplazar exacto
 - Prioriza: errores de sistema > intervenciones humanas > confusiones repetidas > mejoras de eficiencia
+</reglas>
 
-Al terminar, presenta un resumen ejecutivo (máx 500 chars) de lo que encontraste y qué acciones tomaste.`;
+<salida>Al terminar, presenta un resumen ejecutivo (máx 500 chars) de lo que encontraste y qué acciones tomaste.</salida>
+
+<historial_cambios obligatorio="true">
+Si aplicaste algún cambio de código (edit_file, write_file), llama a log_change como ÚLTIMO paso:
+- titulo: frase concisa del cambio
+- desc: qué cambió y por qué
+- archivos: archivos modificados
+- tags: del vocabulario: bug, feature, config, prompt, api, db, telegram, monitor, tacos-bot
+- origen: "autofix" si fue análisis automático, "user" si fue instrucción directa
+
+Si solo consultaste sin modificar archivos, no es necesario.
+</historial_cambios>
+</sistema>`;
 
 async function realizarAnalisisProfundo(contextoExtra = '') {
     console.log('🔬 Iniciando análisis profundo...');
@@ -860,7 +938,12 @@ async function realizarAnalisisProfundo(contextoExtra = '') {
             'Realiza el análisis completo: intervenciones humanas, conversaciones problemáticas y propón mejoras.';
         const resultado = await runAgentLoop(SYSTEM_PROFUNDO, msg);
         if (resultado) {
-            encolarMensaje('analisis-fin', `🔬 *ANÁLISIS COMPLETADO*\n\n${resultado}`);
+            parsearYEncolarPropuestas(resultado);
+            // Enviar resumen al admin (sin los bloques de propuesta que ya se procesaron)
+            const resumenLimpio = resultado.replace(/PROPUESTA_CAMBIO[\s\S]*?FIN_PROPUESTA/g, '').trim();
+            if (resumenLimpio) {
+                encolarMensaje('analisis-fin', `🔬 *ANÁLISIS COMPLETADO*\n\n${resumenLimpio}`);
+            }
         }
     } catch (e) {
         console.error('❌ Error análisis profundo:', e.message);
@@ -868,36 +951,101 @@ async function realizarAnalisisProfundo(contextoExtra = '') {
     }
 }
 
-// ── APLICAR SUGERENCIA (alerta) → instrucciones.txt ──────────────────────────
-async function aplicarSugerenciaAlerta(pendiente) {
-    const { telefono, problema } = pendiente.datos;
-    console.log(`🔧 Aplicando sugerencia alerta [${pendiente.id}]...`);
-    let instruccionesActuales = '';
-    try { instruccionesActuales = fs.readFileSync(INSTRUCCIONES_PATH, 'utf8'); } catch(e) {
-        encolarMensaje(`resp-${pendiente.id}`, `❌ No se pudo leer instrucciones.txt: ${e.message}`);
-        return;
+// ── APLICAR SUGERENCIA (alerta) → reglas_monitor.txt ─────────────────────────
+
+/**
+ * Detecta a qué sección de instrucciones aplica una regla, según el problema.
+ */
+function detectarSeccionRegla(problema) {
+    const txt = (problema.problema + ' ' + problema.sugerencia).toLowerCase();
+    if (/precio|cuenta|total|cobr|pago|transferencia|descuento/.test(txt)) return 'pago';
+    if (/domicilio|envío|ubicación|dirección|gps|pin/.test(txt)) return 'entrega';
+    if (/salud|bienvenid|carnes|horario/.test(txt)) return 'saludo';
+    if (/carne|verdura|ingrediente|combo|menú|pedido|orden|quesadilla|taco/.test(txt)) return 'pedido';
+    return 'general';
+}
+
+/**
+ * Inserta una regla XML dentro de <reglas_activas> en reglas_monitor.txt
+ */
+function insertarReglaMonitor(id, seccion, textoRegla) {
+    let contenido = '';
+    try { contenido = fs.readFileSync(REGLAS_MON_PATH, 'utf8'); } catch(e) {
+        throw new Error(`No se pudo leer reglas_monitor.txt: ${e.message}`);
     }
+    const fecha = new Date().toISOString().slice(0, 10);
+    const nuevaRegla = `  <regla id="${id}" seccion="${seccion}" fecha="${fecha}">\n    ${textoRegla}\n  </regla>`;
+
+    // Insertar antes del cierre de </reglas_activas>
+    const cierre = '</reglas_activas>';
+    if (!contenido.includes(cierre)) {
+        throw new Error('reglas_monitor.txt no tiene </reglas_activas>');
+    }
+    const nuevo = contenido.replace(cierre, nuevaRegla + '\n\n' + cierre);
+    fs.writeFileSync(REGLAS_MON_PATH, nuevo);
+}
+
+/**
+ * Paso 1: Genera la regla con Claude y la muestra al admin para revisión.
+ * No la inserta — queda como pendiente tipo 'regla_preview'.
+ */
+async function generarPreviewRegla(pendiente) {
+    const { telefono, problema } = pendiente.datos;
+    console.log(`🔧 Generando preview de regla [${pendiente.id}]...`);
     try {
-        const editResp = await anthropic.messages.create({
-            model: 'claude-sonnet-4-6', max_tokens: 512,
-            system: `Eres un editor de instrucciones para un bot de WhatsApp de tacos.
-Genera UNA SOLA REGLA clara (máx 3 líneas) para añadir al final del archivo de instrucciones del bot.
-Solo el texto de la regla, sin explicaciones ni encabezados. En español, específico y accionable.`,
-            messages: [{ role: 'user', content: `PROBLEMA: ${problema.problema}\nSUGERENCIA: ${problema.sugerencia}\n\nGenera la regla:` }]
-        });
-        const nuevaRegla = editResp.content[0].text.trim();
-        const fecha = new Date().toLocaleString('es-MX', { timeZone: 'America/Hermosillo' });
-        fs.writeFileSync(INSTRUCCIONES_PATH + '.bak', instruccionesActuales);
-        fs.writeFileSync(INSTRUCCIONES_PATH,
-            instruccionesActuales.trimEnd() +
-            `\n\n--- REGLA MONITOR [${pendiente.id}] ${fecha} ---\n${nuevaRegla}\n`
-        );
+        const promptRegla =
+            `<sistema>\n` +
+            `<identidad>Eres un editor de instrucciones para un bot de WhatsApp de tacos.</identidad>\n` +
+            `<tarea>Genera UNA SOLA REGLA clara (máx 3 líneas). Solo el texto de la regla, sin explicaciones, sin encabezados, sin tags XML. En español, específico y accionable.</tarea>\n` +
+            `<contexto>\n` +
+            `<problema>${problema.problema}</problema>\n` +
+            `<sugerencia>${problema.sugerencia}</sugerencia>\n` +
+            `</contexto>\n` +
+            `</sistema>\n\nGenera la regla:`;
+        const nuevaRegla = (await ejecutarRapido(promptRegla, 30_000)).trim();
+        const seccion = detectarSeccionRegla(problema);
+
+        // Guardar regla generada en el pendiente para el paso 2
+        pendiente.datos.regla_generada = nuevaRegla;
+        pendiente.datos.seccion_regla = seccion;
+        pendiente.tipo = 'regla_preview';
+        guardarPendientes();
+
         encolarMensaje(`resp-${pendiente.id}`,
-            `✅ *Instrucciones actualizadas* [${pendiente.id}]\n\n` +
-            `📝 Regla añadida:\n_${nuevaRegla}_\n\n` +
-            `⚠️ Reinicia el bot:\n` + '`pm2 restart TacosAragon`'
+            `📝 *Regla propuesta* [${pendiente.id}]\n\n` +
+            `📂 Sección: *${seccion}*\n` +
+            `📋 Regla:\n_${nuevaRegla}_\n\n` +
+            `─────────────────────\n` +
+            `!m si   → aplicar regla\n` +
+            `!m no   → descartar\n` +
+            `!m [texto] → corregir`
         );
-        console.log(`  ✅ instrucciones.txt actualizado`);
+        console.log(`  📝 Preview enviada [${seccion}]`);
+    } catch(e) {
+        encolarMensaje(`resp-${pendiente.id}`, `❌ Error generando regla: ${e.message}`);
+    }
+}
+
+/**
+ * Paso 2: El admin aprobó la regla previamente mostrada. Ahora sí insertar.
+ */
+async function aplicarReglaAprobada(pendiente) {
+    const { regla_generada, seccion_regla } = pendiente.datos;
+    console.log(`🔧 Aplicando regla aprobada [${pendiente.id}] → ${seccion_regla}...`);
+    try {
+        insertarReglaMonitor(pendiente.id, seccion_regla, regla_generada);
+        logCambio({
+            titulo:   `Alerta ${pendiente.id}: regla añadida a reglas_monitor.txt`,
+            desc:     `Sección: ${seccion_regla} | Regla: ${regla_generada.slice(0, 120)}`,
+            archivos: ['reglas_monitor.txt'],
+            tags:     ['monitor', 'prompt'],
+            origen:   'user',
+        });
+        encolarMensaje(`resp-${pendiente.id}`,
+            `✅ *Regla aplicada* [${pendiente.id}] (${seccion_regla})\n\n` +
+            `El bot la aplica automáticamente en el siguiente mensaje.`
+        );
+        console.log(`  ✅ reglas_monitor.txt actualizado [${seccion_regla}]`);
     } catch(e) {
         encolarMensaje(`resp-${pendiente.id}`, `❌ Error aplicando sugerencia: ${e.message}`);
     }
@@ -938,6 +1086,13 @@ async function aplicarPropuesta(pendiente) {
 
         fs.writeFileSync(ruta, nuevoContenido);
         prop.aplicada = true;
+        logCambio({
+            titulo:   `Propuesta ${prop.id}: ${prop.descripcion.slice(0, 80)}`,
+            desc:     prop.descripcion,
+            archivos: [prop.archivo],
+            tags:     ['monitor', prop.archivo.endsWith('.js') ? 'code' : 'prompt'],
+            origen:   'user',
+        });
 
         const esJs = prop.archivo.endsWith('.js');
         encolarMensaje(`resp-${prop.id}`,
@@ -962,10 +1117,12 @@ async function procesarInstruccionAdmin(texto, pendiente) {
             : `PROPUESTA: ${pendiente.datos.descripcion}\nARCHIVO: ${pendiente.datos.archivo}`;
 
         const resp = await runAgentLoop(
-            `Eres el asistente del monitor de calidad del bot de tacos. El admin te envía una instrucción o pregunta.
-Responde en español, conciso y útil. Si pide un cambio de código, usa la herramienta proponer_cambio.
-Si puedes resolver sin cambios, hazlo directamente. Máximo 6 líneas en tu respuesta final.`,
-            `${contextoDatos}\n\nMENSAJE DEL ADMIN: ${texto}`
+            `<sistema>
+<identidad>Eres el asistente del monitor de calidad del bot de tacos.</identidad>
+<tarea>El admin te envía una instrucción o pregunta. Responde en español, conciso y útil. Si pide un cambio de código, usa la herramienta proponer_cambio. Si puedes resolver sin cambios, hazlo directamente.</tarea>
+<formato>Máximo 6 líneas en tu respuesta final.</formato>
+</sistema>`,
+            `<contexto>\n${contextoDatos}\n</contexto>\n\n<mensaje_admin>${texto}</mensaje_admin>`
         );
         encolarMensaje(`resp-${pendiente.id}`, `🤖 *Monitor* [${pendiente.id}]\n\n${resp}`);
     } catch(e) {
@@ -974,129 +1131,85 @@ Si puedes resolver sin cambios, hazlo directamente. Máximo 6 líneas en tu resp
 }
 
 // ── CONVERSACIÓN LIBRE CON EL ADMIN (sin alerta previa) ──────────────────────
-const SYSTEM_CONV_LIBRE = `Eres el agente de control de calidad del bot de WhatsApp de Tacos Aragón.
+const SYSTEM_CONV_LIBRE = `<sistema>
+<identidad>
+Eres el agente de control de calidad del bot de WhatsApp de Tacos Aragón.
 El administrador del restaurante te habla directamente. Responde en español, de forma concisa y útil.
-El negocio abre martes–domingo, 6 PM–11:30 PM, zona horaria GMT-7. Cierra los lunes.
+</identidad>
 
-## Reglas de respuesta
+<contexto_negocio>
+Horario: martes–domingo, 6 PM–11:30 PM, zona horaria GMT-7. Cierra los lunes.
+</contexto_negocio>
+
+<reglas_respuesta>
 - Montos siempre en pesos MXN. Redondea a 2 decimales.
 - "esta semana" = martes más reciente 00:00 GMT-7 hasta ahora → usa periodo=semana
 - "hoy" → periodo=hoy | "ayer" → periodo=ayer | "este mes" → periodo=mes
 - Si el admin pide un promedio, calcula tú mismo dividiendo total/días o total/pedidos.
 - Responde directo con los números; no expliques qué endpoint usaste.
+</reglas_respuesta>
 
-## Para VENTAS, DINERO, ESTADÍSTICAS → consultar_api
+<tools_ventas>
+Para VENTAS, DINERO, ESTADÍSTICAS → run_command con curl a la API local.
 
-### Endpoint principal (úsalo para la mayoría de preguntas de ventas):
-  /api/ventas/resumen?periodo=PERIODO
-  Retorna: total, pedidos, ticketPromedio, porPago (nombres legibles), porCanal (domicilio/presencial/recoger), topProductos, reembolsos
+Token: SCRUBBED_TACOS_API_TOKEN
+Base URL: http://tacos-api:3001
 
-### Otros endpoints según la pregunta:
-  /api/ventas/empleados-ventas?periodo=PERIODO  → quién vendió más, ventas por empleado
-  /api/ventas/por-producto?nombre=X&periodo=PERIODO → cuánto dinero/cantidad de un producto (domicilio, asada, adobada, etc.)
-  /api/ventas/grafica?periodo=PERIODO&agrupar=hora   → a qué hora se vende más
-  /api/ventas/grafica?periodo=PERIODO&agrupar=dia    → cuál fue el mejor día
-  /api/dashboard                                      → resumen completo hoy+semana+mes+gráficas
-  /api/ventas/ticket/NUMERO                          → detalle de un ticket específico
-  /api/ventas/cierres?periodo=PERIODO                → cierres de caja: apertura/cierre, quién abrió/cerró,
-                                                        caja_inicial, efectivo_esperado, efectivo_real, diferencia,
-                                                        ventas_netas, descuentos, entradas, salidas, movimientos_caja
+Comandos curl útiles:
+  run_command("curl -s -H \\"x-api-token: TOKEN\\" http://tacos-api:3001/api/ventas/resumen?periodo=hoy")
+  run_command("curl -s -H \\"x-api-token: TOKEN\\" http://tacos-api:3001/api/ventas/resumen?periodo=semana")
+  run_command("curl -s -H \\"x-api-token: TOKEN\\" http://tacos-api:3001/api/ventas/resumen?periodo=mes")
+  run_command("curl -s -H \\"x-api-token: TOKEN\\" http://tacos-api:3001/api/ventas/empleados-ventas?periodo=semana")
+  run_command("curl -s -H \\"x-api-token: TOKEN\\" http://tacos-api:3001/api/ventas/por-producto?nombre=X&periodo=semana")
+  run_command("curl -s -H \\"x-api-token: TOKEN\\" http://tacos-api:3001/api/ventas/cierres?periodo=hoy")
+  run_command("curl -s -H \\"x-api-token: TOKEN\\" http://tacos-api:3001/api/dashboard")
 
-### Ejemplos rápidos:
-  "¿cuánto vendimos hoy?"          → /api/ventas/resumen?periodo=hoy
-  "¿cuánto esta semana?"           → /api/ventas/resumen?periodo=semana
-  "¿cuánto ayer?"                  → /api/ventas/resumen?periodo=ayer
-  "¿cuánto este mes?"              → /api/ventas/resumen?periodo=mes
-  "¿cuánto en efectivo/tarjeta?"   → /api/ventas/resumen?periodo=semana  (porPago viene con nombres)
-  "¿cuánto de domicilio/envíos?"   → /api/ventas/por-producto?nombre=domicilio&periodo=semana
-  "¿cuántos domicilios tuvimos?"   → /api/ventas/resumen?periodo=semana  (porCanal.domicilio)
-  "¿quién vendió más?"             → /api/ventas/empleados-ventas?periodo=semana
-  "¿a qué hora vendemos más?"      → /api/ventas/grafica?periodo=semana&agrupar=hora
-  "¿cuál fue el mejor día?"        → /api/ventas/grafica?periodo=semana&agrupar=dia
-  "¿cuántos tacos de asada?"       → /api/ventas/por-producto?nombre=asada&periodo=semana
-  "ticket promedio"                → campo ticketPromedio en /api/ventas/resumen
-  "¿cuántos reembolsos?"           → campo reembolsos en /api/ventas/resumen
-  "¿cuánto había en caja?"         → /api/ventas/cierres?periodo=hoy
-  "¿hubo diferencia de caja?"      → /api/ventas/cierres?periodo=semana  (campo diferencia)
-  "¿a qué hora abrieron la caja?"  → /api/ventas/cierres?periodo=hoy  (campo apertura)
-  "¿quién cerró la caja?"          → /api/ventas/cierres?periodo=hoy  (campo cerrado_por)
+Mapeo rápido:
+  "¿cuánto hoy/ayer/semana/mes?"  → /api/ventas/resumen?periodo=PERIODO
+  "¿quién vendió más?"            → /api/ventas/empleados-ventas?periodo=semana
+  "¿cuánto en efectivo/tarjeta?"  → /api/ventas/resumen (campo porPago)
+  "¿cuánto de domicilio?"         → /api/ventas/por-producto?nombre=domicilio&periodo=semana
+  "¿cuántos tacos de X?"          → /api/ventas/por-producto?nombre=X&periodo=semana
+  "¿caja hoy?"                    → /api/ventas/cierres?periodo=hoy
+  "resumen general"               → /api/dashboard
 
-⛔ NUNCA uses ejecutar_shell para buscar ventas — los logs de PM2 no tienen esa información.
+(En el comando curl reemplaza TOKEN por el token real de arriba)
+</tools_ventas>
 
-## Para GRÁFICAS o AUDIO → enviar_media
-Úsalo cuando el admin pida "gráfica", "chart", "imagen", "visualización", "por voz", "audio", "dímelo en voz".
+<tools_estado>
+Para ESTADO DEL PROCESO, LOGS o ERRORES:
+  view_logs(lines=100)
+  run_command("tail -50 logs/error.log")
+  run_command("pm2 list")
+</tools_estado>
 
-Flujo estándar para gráfica de ventas:
-  1. consultar_api → /api/ventas/grafica?periodo=semana&agrupar=dia  (obtiene labels y valores)
-  2. enviar_media  → tipo=grafica, datos_grafica={titulo, labels, valores, tipo_grafica}
-  3. Responde con resumen de texto del mismo dato
+<tools_conversaciones>
+Para CONVERSACIONES DE CLIENTES:
+  read_file(path="datos/conversaciones/TELEFONO.txt")
+  search_code(pattern="PATRON", glob="datos/**")
+  list_files(path="datos/")
+</tools_conversaciones>
 
-Ejemplos de datos_grafica:
-  Ventas por día:       {titulo:"Ventas esta semana", labels:["Mar","Mié","Jue","Vie","Sáb","Dom"], valores:[...], tipo_grafica:"bar"}
-  Tendencia mensual:    {tipo_grafica:"line", ...}
-  Top productos:        {tipo_grafica:"horizontalBar", labelDataset:"Unidades vendidas", ...}
-  Por canal:            {titulo:"Pedidos por canal", labels:["domicilio","llevar","comer aqui"], valores:[38,34,27], tipo_grafica:"bar"}
+<tools_codigo>
+Para CÓDIGO O REGLAS DEL BOT:
+  read_file(path="datos/instrucciones.txt")
+  read_file(path="index.js")
+</tools_codigo>
 
-Flujo para audio:
-  1. (opcional) consultar_api para obtener los datos
-  2. Redacta un texto conciso en español (máx 200 chars): "Esta semana vendimos $24,492. 114 pedidos. Ticket promedio $214."
-  3. enviar_media → tipo=audio, texto_voz="..."
-
-## Para ESTADO DEL PROCESO, ERRORES o LOGS → ejecutar_shell
-  pm2 status
-  pm2 logs TacosAragon --lines 30 --nostream
-  grep -i "error" logs/error.log | tail -20
-
-## Para CONVERSACIONES DE CLIENTES → leer_conversacion, listar_conversaciones, buscar_en_conversaciones
-## Para CÓDIGO O REGLAS DEL BOT → leer_archivo
-## Para PROPONER MEJORAS → proponer_cambio`;
-
-// Historial de conversación libre en memoria (por sesión del proceso)
-const convLibreHistorial = []; // [{ role, content }]
+<proponer_mejoras>
+Para proponer mejoras, incluir bloque PROPUESTA_CAMBIO...FIN_PROPUESTA en la respuesta.
+</proponer_mejoras>
+</sistema>`;
 
 async function procesarConversacionLibre(convId, texto) {
     console.log(`💬 Conversación libre: "${texto.slice(0, 80)}"`);
     try {
-        convLibreHistorial.push({ role: 'user', content: texto });
-
-        // Mantener historial manejable (últimos 20 turnos)
-        if (convLibreHistorial.length > 40) convLibreHistorial.splice(0, 2);
-
-        const messages = [...convLibreHistorial];
-        let iter = 0;
-        const MAX_ITER = 10;
-
-        while (iter++ < MAX_ITER) {
-            const response = await anthropic.messages.create({
-                model:      'claude-sonnet-4-6',
-                max_tokens: 2048,
-                system:     SYSTEM_CONV_LIBRE,
-                tools:      TOOLS,
-                messages
-            });
-
-            if (response.stop_reason === 'end_turn') {
-                const textBlock = response.content.find(c => c.type === 'text');
-                const respuesta = textBlock?.text || '';
-                convLibreHistorial.push({ role: 'assistant', content: respuesta });
-                encolarMensaje(`conv-resp-${convId}`, `🤖 *Monitor*\n\n${respuesta}`);
-                return;
-            }
-
-            if (response.stop_reason === 'tool_use') {
-                messages.push({ role: 'assistant', content: response.content });
-                const toolResults = [];
-                for (const block of response.content) {
-                    if (block.type !== 'tool_use') continue;
-                    console.log(`  🔧 Tool: ${block.name}`);
-                    const result = await executeTool(block.name, block.input);
-                    toolResults.push({ type: 'tool_result', tool_use_id: block.id, content: String(result) });
-                }
-                messages.push({ role: 'user', content: toolResults });
-            } else {
-                break;
-            }
-        }
+        const resultado = await ejecutarProfundo(SYSTEM_CONV_LIBRE, texto, 300_000);
+        const respuesta = (resultado.output || '(sin respuesta)').trim();
+        // Procesar propuestas de código si Claude las incluyó
+        parsearYEncolarPropuestas(respuesta);
+        const respuestaLimpia = respuesta.replace(/PROPUESTA_CAMBIO[\s\S]*?FIN_PROPUESTA/g, '').trim();
+        encolarMensaje(`conv-resp-${convId}`, `🤖 *Monitor*\n\n${respuestaLimpia || respuesta}`);
     } catch(e) {
         console.error('❌ Error conversación libre:', e.message);
         encolarMensaje(`conv-resp-${convId}`, `❌ Error: ${e.message}`);
@@ -1143,32 +1256,36 @@ async function procesarComandoAdmin(cmd) {
         }
 
         case 'reiniciar': {
-            // Verificar que el orquestador no esté en medio de una recuperación activa
-            const ORCH_DB_PATH = process.env.ORCH_DB_PATH;
-            if (ORCH_DB_PATH) {
-                try {
-                    const Database = require('better-sqlite3');
+            // Verificar que el orquestador no tenga una recuperacion activa sobre TacosAragon
+            // para evitar conflicto: orch hace stop+taskkill+start mientras monitor hace restart
+            try {
+                const ORCH_DB_PATH = process.env.ORCH_DB_PATH ||
+                    path.join(BASE, '..', 'ecosistema-aragon', 'tacos-aragon-orchestrator', 'orchestrator', 'data', 'orchestrator.db');
+                if (fs.existsSync(ORCH_DB_PATH)) {
+                    const Database = require('../node_modules/better-sqlite3');
                     const orchDb = new Database(ORCH_DB_PATH, { readonly: true });
                     const falla = orchDb.prepare(
                         `SELECT en_cooldown FROM fallas WHERE servicio = 'TacosAragon' LIMIT 1`
                     ).get();
                     orchDb.close();
                     if (falla && falla.en_cooldown === 1) {
-                        encolarMensaje('cmd-reiniciar-bloq',
-                            '⚠️ *Monitor:* Reinicio bloqueado — el orquestador ya está ejecutando una recuperación de TacosAragon. Espera a que termine.'
+                        encolarMensaje('cmd-reiniciar-bloqueado',
+                            'Monitor: El orquestador ya esta ejecutando una recuperacion sobre TacosAragon. ' +
+                            'Espera a que termine (max 5 min) antes de reiniciar manualmente.'
                         );
                         break;
                     }
-                } catch (e) {
-                    console.error('[monitor] No se pudo verificar estado del orquestador:', e.message);
                 }
+            } catch (e) {
+                // Si no se puede leer la DB del orquestador, continuar con el reinicio normal
             }
-            encolarMensaje('cmd-reiniciar', '🔄 *Monitor:* Reiniciando TacosAragon...');
+
+            encolarMensaje('cmd-reiniciar', 'Monitor: Reiniciando TacosAragon...');
             try {
                 execSync('pm2 restart TacosAragon', { stdio: 'ignore' });
-                encolarMensaje('cmd-reiniciar-ok', '✅ *Monitor:* `pm2 restart TacosAragon` ejecutado. Verificando conexión en 90s...');
+                encolarMensaje('cmd-reiniciar-ok', 'Monitor: pm2 restart TacosAragon ejecutado. Verificando conexion en 90s...');
             } catch (e) {
-                encolarMensaje('cmd-reiniciar-err', `❌ *Monitor:* Error al reiniciar: ${e.message}`);
+                encolarMensaje('cmd-reiniciar-err', `Monitor: Error al reiniciar: ${e.message}`);
             }
             break;
         }
@@ -1189,57 +1306,79 @@ async function procesarComandoAdmin(cmd) {
 let procesandoRespuestas = false; // Guard anti-reentrancia
 
 async function procesarRespuestas() {
-    if (procesandoRespuestas) return; // Evitar solapamiento entre ciclos
-    const responses = mensajesDb.leerResponsesPendientes();
-    if (!responses.length) return;
+    if (procesandoRespuestas) return;
+    const rows = mensajesDb.leerResponsesPendientes();
+    if (!rows.length) return;
 
     procesandoRespuestas = true;
-
     try {
-        for (const resp of responses) {
-            try {
-                // Comandos especiales (id empieza con 'cmd-')
-                if (resp.id.startsWith('cmd-')) {
-                    await procesarComandoAdmin(resp.texto);
-                    mensajesDb.marcarResponseProcesada(resp.rowid);
-                    continue;
-                }
+        for (const resp of rows) {
+            // Los mensajes pmo-* son del PMO Agent, no del monitor
+            if (resp.id.startsWith('pmo')) {
+                continue;
+            }
 
-                // Conversación libre (id empieza con 'conv-') — sin alerta pendiente
-                if (resp.id.startsWith('conv-')) {
-                    await procesarConversacionLibre(resp.id, resp.texto);
-                    mensajesDb.marcarResponseProcesada(resp.rowid);
-                    continue;
-                }
+            mensajesDb.marcarResponseProcesada(resp.rowid);
 
-                // Las propuestas se encolan con id 'propuesta-P1' pero el pendiente usa 'P1'
-                const lookupId = resp.id.startsWith('propuesta-') ? resp.id.slice('propuesta-'.length) : resp.id;
-                const pendiente = pendientes.find(p => p.id === lookupId);
-                if (!pendiente) { mensajesDb.marcarResponseProcesada(resp.rowid); continue; }
+            if (resp.id.startsWith('cmd-')) {
+                await procesarComandoAdmin(resp.texto);
+                continue;
+            }
 
-                const texto = (resp.texto || '').trim();
-                console.log(`📨 Respuesta admin [${resp.id}]: "${texto.slice(0, 60)}"`);
-
-                if (texto.toLowerCase() === 'si') {
-                    if (pendiente.tipo === 'propuesta') {
-                        await aplicarPropuesta(pendiente);
+            if (resp.id.startsWith('conv-')) {
+                const textoNorm = (resp.texto || '').trim().toLowerCase();
+                if (textoNorm === 'si' || textoNorm === 'no') {
+                    const ultimo = [...pendientes].reverse().find(p => !p.datos?.aplicada);
+                    if (ultimo) {
+                        if (textoNorm === 'si') {
+                            if (ultimo.tipo === 'propuesta') await aplicarPropuesta(ultimo);
+                            else if (ultimo.tipo === 'regla_preview') await aplicarReglaAprobada(ultimo);
+                            else await generarPreviewRegla(ultimo);
+                        } else {
+                            encolarMensaje(`resp-${ultimo.id}`, `Monitor — [${ultimo.id}] rechazado.`);
+                        }
+                        if (ultimo.tipo !== 'regla_preview' || textoNorm === 'no') {
+                            pendientes = pendientes.filter(p => p.id !== ultimo.id);
+                            guardarPendientes();
+                        }
                     } else {
-                        await aplicarSugerenciaAlerta(pendiente);
+                        encolarMensaje(`conv-resp-${resp.id}`, `Monitor — No hay pendientes activos.`);
                     }
-                } else if (texto.toLowerCase() === 'no') {
-                    encolarMensaje(`resp-${resp.id}`, `🤖 Monitor — [${resp.id}] rechazado.`);
-                } else {
-                    await procesarInstruccionAdmin(texto, pendiente);
+                    continue;
                 }
+                await procesarConversacionLibre(resp.id, resp.texto);
+                continue;
+            }
 
+            const lookupId = resp.id.startsWith('propuesta-') ? resp.id.slice('propuesta-'.length) : resp.id;
+            const pendiente = pendientes.find(p => p.id === lookupId);
+            if (!pendiente) continue;
+
+            const texto = (resp.texto || '').trim();
+            console.log(`Respuesta admin [${resp.id}]: "${texto.slice(0, 60)}"`);
+
+            if (texto.toLowerCase() === 'si') {
+                if (pendiente.tipo === 'propuesta') {
+                    await aplicarPropuesta(pendiente);
+                } else if (pendiente.tipo === 'regla_preview') {
+                    await aplicarReglaAprobada(pendiente);
+                } else {
+                    await generarPreviewRegla(pendiente);
+                }
+            } else if (texto.toLowerCase() === 'no') {
+                encolarMensaje(`resp-${resp.id}`, `Monitor — [${resp.id}] rechazado.`);
+            } else {
+                await procesarInstruccionAdmin(texto, pendiente);
+            }
+
+            // No borrar si pasó a regla_preview (espera segundo "si")
+            if (pendiente.tipo !== 'regla_preview') {
                 pendientes = pendientes.filter(p => p.id !== lookupId);
                 guardarPendientes();
-                mensajesDb.marcarResponseProcesada(resp.rowid);
-            } catch (err) {
-                console.error(`[monitor] Error procesando respuesta ${resp.id}:`, err.message);
-                mensajesDb.devolverResponseSinProcesar(resp.rowid);
             }
         }
+    } catch (e) {
+        console.error('Error procesarRespuestas:', e.message);
     } finally {
         procesandoRespuestas = false;
     }
@@ -1250,45 +1389,34 @@ let tacosRestartCount = -1; // -1 = no inicializado aún
 
 async function verificarConexionWhatsApp(restartNum) {
     console.log(`🔍 Verificando conexión WhatsApp post-reinicio #${restartNum}...`);
+    const WA_PORT = parseInt(process.env.WA_HEALTH_PORT || '3003', 10);
+
     try {
-        const resumen = await runAgentLoop(
-            `Eres el monitor del bot de Tacos Aragón. El proceso TacosAragon acaba de reiniciarse.
-Tu tarea: verificar si WhatsApp se conectó correctamente siguiendo estos pasos:
+        const data = await new Promise((resolve, reject) => {
+            const req = http.get(`http://127.0.0.1:${WA_PORT}/health`, { timeout: 5000 }, (res) => {
+                let body = '';
+                res.on('data', c => body += c);
+                res.on('end', () => resolve({ status: res.statusCode, body }));
+            });
+            req.on('error', reject);
+            req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
+        });
 
-1. Verifica el estado actual del proceso:
-   ejecutar_shell("pm2 status")
-
-2. Lee los logs recientes del bot:
-   ejecutar_shell("pm2 logs TacosAragon --lines 60 --nostream")
-
-3. Busca en los logs la señal de arranque exitoso:
-   La frase clave es: "✅ SISTEMA ACTIVO (Memoria Extendida)"
-   También busca errores como: "Chrome", "Session", "Auth", "❌", "timeout"
-
-4. Si el bot NO se conectó (no aparece la frase clave o hay errores):
-   - Ejecuta: ejecutar_shell("tail -50 logs/error.log")
-   - Diagnostica qué falló
-   - La secuencia correcta de reinicio es:
-     a) pm2 stop TacosAragon
-     b) Cerrar todos los procesos chrome.exe
-     c) Borrar: C:/SesionBot/SingletonLock, SingletonCookie, SingletonSocket, DevToolsActivePort
-     d) pm2 start TacosAragon
-
-Responde en máximo 300 chars con: "✅ Bot conectado [detalles]" o "❌ Bot NO conectado — [diagnóstico y pasos sugeridos]"`,
-            `Verificar arranque de TacosAragon reinicio #${restartNum}`
-        );
-
-        const exito = resumen && /SISTEMA ACTIVO|conectado|ready|✅/i.test(resumen);
+        const json = JSON.parse(data.body);
+        const exito = data.status === 200 && json.ok === true;
         const emoji = exito ? '✅' : '🔴';
+        const detalle = exito
+            ? `WhatsApp conectado (health :${WA_PORT} → 200)`
+            : `WhatsApp NO conectado (health :${WA_PORT} → ${data.status})`;
 
         encolarMensaje(`verificacion-${restartNum}`,
-            `${emoji} *Verificación post-reinicio #${restartNum}*\n\n${resumen || 'No se pudo obtener resultado.'}`
+            `${emoji} *Verificación post-reinicio #${restartNum}*\n\n${detalle}`
         );
-        console.log(`  ${emoji} Resultado verificación #${restartNum}: ${(resumen || '').slice(0, 80)}`);
+        console.log(`  ${emoji} Resultado verificación #${restartNum}: ${detalle}`);
     } catch(e) {
         console.error('❌ verificarConexionWhatsApp:', e.message);
         encolarMensaje(`verificacion-err-${restartNum}`,
-            `❌ *Error al verificar arranque #${restartNum}:*\n${e.message}`
+            `🔴 *Verificación post-reinicio #${restartNum}*\n\nNo se pudo contactar el health endpoint: ${e.message}`
         );
     }
 }
@@ -1363,10 +1491,12 @@ Respuesta final: resumen ejecutivo breve (máx 300 chars) para el admin.`,
         );
 
         if (resumen) {
+            parsearYEncolarPropuestas(resumen);
+            const resumenLimpio = resumen.replace(/PROPUESTA_CAMBIO[\s\S]*?FIN_PROPUESTA/g, '').trim();
             encolarMensaje('log-error-' + Date.now(),
                 `🔴 *ERRORES EN LOGS DETECTADOS*\n\n` +
                 `📋 ${lineasError.length} líneas de error nuevas\n\n` +
-                `🤖 *Análisis:*\n${resumen}`
+                `🤖 *Análisis:*\n${resumenLimpio || resumen}`
             );
         }
     } catch (e) {
@@ -1375,15 +1505,16 @@ Respuesta final: resumen ejecutivo breve (máx 300 chars) para el admin.`,
 }
 
 // ── INICIALIZACIÓN ────────────────────────────────────────────────────────────
+// mensajes_db se inicializa al primer require (WAL mode, tablas creadas automaticamente)
 
 // Inicializar tamaño actual de logs (no analizar todo el historial al arrancar)
 try { estadoLogs.errorLogSize  = fs.statSync(ERROR_LOG).size;  } catch(e) {}
 try { estadoLogs.outputLogSize = fs.statSync(OUTPUT_LOG).size; } catch(e) {}
 
 console.log('🤖 Agente Monitor iniciado');
-console.log(`   Modelo: claude-sonnet-4-6 (tool use habilitado)`);
+console.log(`   Modo: claude -p (plan Max, sin API key)`);
+console.log(`   MCP: project-tacos-bot (${require('./mcp-monitor.json').mcpServers['project-tacos-bot'].args.join(' ')})`);
 console.log(`   Estado previo: ${Object.keys(estadoConv).length} conversaciones analizadas`);
-console.log(`   Tools disponibles: ${TOOLS.map(t => t.name).join(', ')}`);
 
 // Polling sobre la DB SQLite cada 5s (fs.watch no es confiable con SQLite WAL en Windows)
 setInterval(procesarMemoria, 5000);
@@ -1418,6 +1549,11 @@ setInterval(async () => {
         const procs = JSON.parse(salidaJson);
         const tacos = procs.find(p => p.name === 'TacosAragon');
         if (!tacos) {
+            // Si la lista está vacía, probablemente no hay acceso al Docker socket — no alertar
+            if (procs.length === 0) {
+                console.log('⏱️ Revisión 30min: pm2 jlist vacío (sin acceso Docker socket) — omitiendo');
+                return;
+            }
             encolarMensaje('salud-' + Date.now(), '🔴 *ALERTA:* TacosAragon no aparece en PM2.');
             return;
         }
@@ -1476,15 +1612,7 @@ setInterval(() => {
     }
 }, 60 * 60 * 1000);
 
-// Limpieza de cola cada hora
-setInterval(() => {
-    try {
-        mensajesDb.limpiarQueueViejos();
-        console.log('🧹 Cola limpiada (mensajes enviados > 1h eliminados)');
-    } catch (e) {
-        console.error('[monitor] Error en limpieza de cola:', e.message);
-    }
-}, 3600000);
+// La limpieza de cola la maneja el telegram-dispatcher (SQLite mensajes_queue).
 
 process.on('SIGINT',  () => { guardarEstado(); process.exit(0); });
 process.on('SIGTERM', () => { guardarEstado(); process.exit(0); });
