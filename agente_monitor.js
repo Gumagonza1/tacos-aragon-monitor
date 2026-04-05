@@ -893,7 +893,7 @@ search_code, list_files, run_command, view_logs, git_status, git_diff, restart_p
 7. Para errores de código: search_code(pattern="Error|❌", glob="logs/error.log")
 8. Lee el código relevante: read_file(path="index.js") o read_file(path="datos/instrucciones.txt")
 9. Para datos de ventas: run_command con curl a la API local:
-   run_command("curl -s -H \\"x-api-token: SCRUBBED_TACOS_API_TOKEN\\" http://tacos-api:3001/api/ventas/resumen?periodo=hoy")
+   run_command("curl -s -H \\"x-api-token: ${process.env.TACOS_API_TOKEN}\\" http://tacos-api:3001/api/ventas/resumen?periodo=hoy")
 </proceso>
 
 <proponer_cambios>
@@ -1152,7 +1152,7 @@ Horario: martes–domingo, 6 PM–11:30 PM, zona horaria GMT-7. Cierra los lunes
 <tools_ventas>
 Para VENTAS, DINERO, ESTADÍSTICAS → run_command con curl a la API local.
 
-Token: SCRUBBED_TACOS_API_TOKEN
+Token: ${process.env.TACOS_API_TOKEN}
 Base URL: http://tacos-api:3001
 
 Comandos curl útiles:
